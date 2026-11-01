@@ -2,7 +2,7 @@
 
 A small, dependency-free Java implementation of the **Circuit Breaker** pattern, written as a low-level design (LLD) exercise. It protects calls to a flaky remote dependency: it stops hammering a failing service, waits out a cool-down period, and then verifies recovery with a limited number of probe requests before resuming normal traffic.
 
-The whole implementation is ~400 lines of plain Java with no third-party dependencies.
+The whole implementation is 323 lines of plain Java across ten files, with no third-party dependencies and no build tooling.
 
 ---
 
@@ -77,6 +77,8 @@ The compact constructor rejects invalid input, so a misconfigured breaker fails 
 - `successThreshold` must not exceed `halfOpenThreshold`;
 - `openDuration` must be a positive, non-null `Duration`.
 
+Each of those four rules is exercised in the smoke test below; all four raise `IllegalArgumentException` as intended.
+
 ---
 
 ## Usage
@@ -127,6 +129,14 @@ CircuitBreakerFacade breaker = new CircuitBreakerFacade(config, fixedClock);
 
 `CircuitBreakerMetrics` exposes `getRequestNo()`, `getSuccessCount()`, `getFailureCount()` and `getTimestamp()`, all `synchronized`.
 
+`requestNo` counts every request the facade sees, including rejected ones, so the rejection count is:
+
+```java
+long rejected = metrics.getRequestNo() - metrics.getSuccessCount() - metrics.getFailureCount();
+```
+
+That arithmetic is the only way to see rejections today; see review note 4.
+
 ---
 
 ## Build and run
@@ -137,7 +147,25 @@ The repository currently ships sources only — there is no `pom.xml` or `build.
 javac -d out $(find lld -name '*.java')
 ```
 
-Requires **JDK 17+** (`CircuitBreakerConfig` is a `record`). The sources compile cleanly; the only `-Xlint:all` warning is a missing `serialVersionUID` on `CircuitBreakerOpenException`.
+Requires **JDK 17+** (`CircuitBreakerConfig` is a `record`). Verified with Temurin 17.0.21: the ten sources compile with no errors, and `-Xlint:all` produces exactly one warning — a missing `serialVersionUID` on `CircuitBreakerOpenException`.
+
+### Verified behaviour
+
+A throwaway harness driven by a hand-advanced `Clock` confirmed the following, all against the sources as they stand:
+
+| Scenario | Observed |
+| --- | --- |
+| 3 consecutive failures with `failureThreshold = 3` | states `CLOSED, CLOSED, OPEN`; the next request throws `CircuitBreakerOpenException` |
+| Success between failure runs | resets the counter — two failures, one success, two more failures leaves the breaker `CLOSED` |
+| `openDuration = 30s` | rejected at `t+29.999s`, admitted at `t+30.000s` and the state becomes `HALF_OPEN` |
+| `halfOpenThreshold = 3` | probes 1–3 admitted, probe 4 rejected |
+| Probe succeeds, then a probe fails | stays `HALF_OPEN` after the success, reopens on the failure |
+| One success and one failure plus two rejections | `requestNo = 4`, `successCount = 1`, `failureCount = 1`, so two requests are unaccounted for in the counters |
+| Slow call | a call that finished 10s later was timestamped with its *start* time |
+| Domain `RuntimeException` from the callback | comes back as `java.lang.RuntimeException` with the domain exception as `cause` |
+| `AssertionError` from the callback | escapes uncaught, breaker stays `CLOSED`, `failureCount` stays `0` |
+
+These confirm the review notes below rather than contradicting them.
 
 ---
 
@@ -155,7 +183,7 @@ The implementation is a small case study in the SOLID principles:
 
 ## Known limitations
 
-- **No retries, fallbacks, timeouts or async execution.** The facade wraps exactly one call.
+- **No retries, fallbacks, timeouts or async execution.** The facade wraps exactly one call. The missing timeout is the significant one: a dependency that hangs rather than fails never records an outcome, so the breaker stays `CLOSED` and every caller blocks. Without a timeout the breaker cannot deliver its main promise — failing fast.
 - **Consecutive-failure counting only.** A slow trickle of failures across a long period is treated the same as a burst; a rolling failure-rate window would be more realistic in production.
 - **Single instance.** Metrics and state are in-process; there is no shared/distributed breaker state.
 - **Check and record are not atomic across threads.** `allowRequest` and `record*` are individually `synchronized`, but a request is admitted and recorded in two separate critical sections, so concurrent callers can interleave (see review notes below).
@@ -163,20 +191,21 @@ The implementation is a small case study in the SOLID principles:
 
 ### Review notes
 
-A read-through of the current sources surfaced the following points, none of which affect the happy path but all of which are worth addressing before production use:
+A read-through of the current sources — backed by the harness runs above — surfaced the following points. None affect the happy path; all are worth addressing before production use.
 
-1. **`HalfOpenState.allowRequest` mutates state.** It calls `incrementHalfOpenProbeCount()` and then compares, so a request that ends up *rejected* has still consumed a probe slot. Increment only after the check passes.
-2. **The `else if` branch in `HalfOpenState.onSuccess` is effectively dead.** Given `successThreshold <= halfOpenThreshold` and immediate reopening on any failed probe, the "ran out of probes without enough successes" branch cannot be reached through the normal flow; it hides intent rather than guarding a real case.
-3. **Probe counters reset only on transitions.** `halfOpenProbeCount` and `halfOpenSuccessCount` are cleared in `open()`, `halfOpen()` and `close()`, which is fine today but makes the state objects depend on the orchestrator clearing them at the right moments.
-4. **Rejected requests are invisible in metrics.** `recordRejected` bumps `requestNo` but there is no `rejectedCount`, so `requestNo != successCount + failureCount` with no way to account for the gap.
-5. **Metric timestamps are start times.** The facade captures `now` once, before the call, and records it afterwards, so a slow call is timestamped at its start. Capture the clock again when recording the outcome.
-6. **`catch (Exception)` does not catch `Error`.** A dependency that throws `Error` (or an unchecked failure that escapes as one) will never trip the breaker. `catch (Throwable)` with careful rethrow, or at minimum documenting the choice, would be safer.
+1. **`HalfOpenState.allowRequest` mutates state before it decides.** It calls `incrementHalfOpenProbeCount()` and then compares, so a request that is *rejected* has still consumed a probe slot. Running five `allowRequest` calls against a `halfOpenThreshold` of 3 leaves the counter at 5 while only three probes were admitted, and it keeps climbing for every rejected request during a long `OPEN` spell. Increment only after the check passes.
+2. **The `else if` branch in `HalfOpenState.onSuccess` is dead.** With `successThreshold <= halfOpenThreshold`, and a close firing the moment the success count reaches the threshold, the "ran out of probes without enough successes" branch cannot be reached. It reads as a real case and is not one; deleting it (or turning it into an assertion) makes the policy clearer.
+3. **Probe counters are reset only on transitions.** `halfOpenProbeCount` and `halfOpenSuccessCount` are cleared in `open()`, `halfOpen()` and `close()`, which works today but makes the state objects depend on the orchestrator clearing them at exactly the right moments. `consecutiveFailures` is reset only in `close()`, so it silently carries a stale value through every `OPEN -> HALF_OPEN -> OPEN` cycle. Letting each state own its own counters would remove the coupling.
+4. **Rejected requests are invisible in the metrics.** `recordRejected` bumps `requestNo` but there is no `rejectedCount`, so `requestNo != successCount + failureCount` with no first-class way to account for the gap. Add the counter.
+5. **Metric timestamps are start times.** The facade captures `now` once, before the call, and records it afterwards, so a slow call is timestamped at its start — a 10-second call is stamped 10 seconds early. Capture the clock again when recording the outcome; that also makes latency measurable.
+6. **`catch (Exception)` does not catch `Error`.** A dependency that throws `Error` never trips the breaker; the `Error` escapes and the breaker stays `CLOSED`. `catch (Throwable)` with a careful rethrow, or at minimum documenting the choice, would be safer.
 7. **Exceptions are always re-wrapped.** Even a `RuntimeException` from the callback comes back wrapped in a new `RuntimeException`, so callers cannot catch their own domain exception types. Rethrowing unchecked exceptions unchanged and wrapping only checked ones is friendlier.
-8. **`CircuitBreakerOrchestrator` exposes a wide mutation surface.** `open()`, `halfOpen()`, `close()` and the `increment*` methods are `public` and unsynchronized, so the state objects and any other caller can drive transitions. Narrowing this to a package-private transition interface would enforce the invariants.
-9. **`canTryHalfOpen` can NPE.** It dereferences `openedAt` with no null check; it is only safe because `open()` always sets it first. A guard (or returning `false`) makes the contract explicit.
-10. **`new` inside the composition root.** The facade constructs its orchestrator and metrics directly, and the orchestrator constructs its state objects. Injecting them (or a factory) would make unit testing and mocking much easier.
-11. **Package cycle.** `core` imports `state` while every state imports `core`. It works, but it is the one structural smell in an otherwise clean package layout — extracting a small transition/context type both packages can depend on would break the cycle.
-12. **No tests.** The `Clock` injection is already in place; a handful of deterministic tests covering each transition would lock the behaviour down.
+8. **A nested breaker's rejection is treated as a failure.** If the protected call itself goes through another circuit breaker and that breaker throws `CircuitBreakerOpenException`, this breaker records it as a dependency failure and wraps it. The two cases — "the dependency is down" and "we did not call the dependency" — need to be distinguishable.
+9. **`CircuitBreakerOrchestrator` exposes a wide mutation surface.** `open()`, `halfOpen()`, `close()` and the `increment*` methods are `public` and unsynchronized, so the state objects and any other caller can drive transitions. Narrowing this to a package-private transition interface would enforce the invariants.
+10. **`canTryHalfOpen` can NPE.** It dereferences `openedAt` with no null check; calling it while the breaker is `CLOSED` throws `NullPointerException` on `openedAt.plus(...)`. It is only safe because `open()` always sets the field first. A guard (or returning `false`) makes the contract explicit.
+11. **`new` inside the composition root.** The facade constructs its orchestrator and metrics directly, and the orchestrator constructs its state objects. Injecting them (or a factory) would make unit testing and mocking much easier.
+12. **Package cycle.** `core` imports `state` while every state imports `core`. It works, but it is the one structural smell in an otherwise clean package layout — extracting a small transition/context type both packages can depend on would break the cycle.
+13. **No tests.** The `Clock` injection is already in place, so the harness behind the table above was trivial to write; a handful of deterministic JUnit tests covering each transition would lock the behaviour down. Adding a `pom.xml` or `build.gradle` at the same time would give the sources a home outside `lld/`.
 
 ---
 
