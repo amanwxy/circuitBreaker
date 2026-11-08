@@ -4,7 +4,7 @@ A small, dependency-free Java implementation of the **Circuit Breaker** pattern,
 
 The whole implementation is 323 lines of plain Java across ten files, with no third-party dependencies and no build tooling.
 
-> **Review status** — reviewed at commit `bf5e5d0` (3 November 2026). The only change since the previous review at `8a101c2` is this file: all ten Java sources are untouched, so the compile and behaviour results below carry over from that review and were not re-run in this pass. The ten files compile cleanly on Temurin 17.0.21 and a 32-check harness drives every transition, boundary and failure path described below; all 32 checks pass. Fifteen review findings are recorded at the end, none of which break the happy path — but note 1 is not merely counter noise: it makes the branch in note 2 reachable, and that path reopens the breaker after a *successful* probe. The harness lives outside this repository — see [Build and run](#build-and-run).
+> **Review status** — sources reviewed at commit `07d0924` (5 November 2026) and re-checked on 9 November 2026, with no change to any Java source since `8a101c2`: only `README.md` has moved in that time. All ten Java sources are untouched, so the compile and behaviour results below carry over from the `bf5e5d0` pass and were not re-run. The ten files compile cleanly on Temurin 17.0.21 and a 32-check harness drives every transition, boundary and failure path described below; all 32 checks pass. Fifteen review findings are recorded at the end, none of which break the happy path — but note 1 is not merely counter noise: it makes the branch in note 2 reachable, and that path reopens the breaker after a *successful* probe. The harness lives outside this repository — see [Build and run](#build-and-run).
 
 ---
 
@@ -207,7 +207,7 @@ The implementation is a small case study in the SOLID principles:
 
 ### Review notes
 
-A line-by-line read of the sources at `8a101c2` — identical to `bf5e5d0` — backed by the harness runs above, surfaced the following. None affect the happy path; all are worth addressing before production use.
+A line-by-line read of the sources at `8a101c2` — unchanged through `07d0924` — backed by the harness runs above, surfaced the following. None affect the happy path; all are worth addressing before production use.
 
 | # | Severity | Finding | Where |
 | --- | --- | --- | --- |
