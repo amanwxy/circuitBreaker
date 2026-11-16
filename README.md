@@ -4,7 +4,7 @@ A small, dependency-free Java implementation of the **Circuit Breaker** pattern,
 
 The whole implementation is 323 lines of plain Java across ten files, with no third-party dependencies and no build tooling.
 
-> **Review status** — sources re-reviewed at commit `2b8ba8f` (12 November 2026) and re-checked on 16 November 2026. No Java source has changed since `8a101c2` (1 November 2026): `git diff 8a101c2..HEAD -- lld` is empty, and all five commits after it touch only `README.md`. The ten sources were recompiled and re-exercised for this pass — they compile cleanly on Temurin 17.0.21, `-Xlint:all` still produces exactly one warning, a 50-check harness drives every transition, boundary and failure path described below, and a 126-configuration sweep covers the transition logic; every check passes. Seventeen review findings are recorded at the end, none of which break the happy path — but note 1 is not merely counter noise: it keeps note 2 reachable, and that path reopens the breaker after a *successful* probe (note 2 also fires with queued concurrent probes and no rejections at all), while note 16 lets a caller-side bug open the breaker against a healthy dependency and note 17 shows a probe that never returns wedging the breaker in `HALF_OPEN` for good. The harness lives outside this repository — see [Build and run](#build-and-run).
+> **Review status** — sources re-reviewed at commit `21d5289` (17 November 2026). No Java source has changed since `8a101c2` (1 November 2026): `git diff 8a101c2..HEAD -- lld` is empty, and all five commits after it touch only `README.md`. The ten sources were recompiled and re-exercised for this pass — they compile cleanly on Temurin 17.0.21, `-Xlint:all` still produces exactly one warning, a 56-check harness drives every transition, boundary and failure path described below, and a 126-configuration sweep covers the transition logic; every check passes. This pass also corrected the invalid-configuration count (ten, not seven) and clarified the row that records the tripping failure. Seventeen review findings are recorded at the end, none of which break the happy path — but note 1 is not merely counter noise: it keeps note 2 reachable, and that path reopens the breaker after a *successful* probe (note 2 also fires with queued concurrent probes and no rejections at all), while note 16 lets a caller-side bug open the breaker against a healthy dependency and note 17 shows a probe that never returns wedging the breaker in `HALF_OPEN` for good. The harness lives outside this repository — see [Build and run](#build-and-run).
 
 ---
 
@@ -81,7 +81,7 @@ The compact constructor rejects invalid input, so a misconfigured breaker fails 
 - `successThreshold` must not exceed `halfOpenThreshold`;
 - `openDuration` must be a positive, non-null `Duration`.
 
-All seven invalid combinations that exercise these rules were run against the record — zero and negative thresholds, `successThreshold > halfOpenThreshold`, and zero, negative and `null` durations — and every one raises `IllegalArgumentException`.
+Ten invalid combinations that exercise these rules were run against the record — a zero and a negative value for each of the three thresholds (six cases), `successThreshold > halfOpenThreshold`, and zero, negative and `null` durations — and every one raises `IllegalArgumentException`.
 
 ---
 
@@ -164,7 +164,7 @@ Every row below was produced by running the sources — a throwaway harness in t
 
 | Scenario | Observed |
 | --- | --- |
-| 3 consecutive failures with `failureThreshold = 3` | states `CLOSED, CLOSED, CLOSED, OPEN`; the next request throws `CircuitBreakerOpenException` |
+| 3 consecutive failures with `failureThreshold = 3` | all three calls are admitted under `CLOSED` and the third trips the breaker, which reads `OPEN` as soon as that call returns; the next request throws `CircuitBreakerOpenException` |
 | Success between failure runs | resets the counter — two failures, one success, two more failures leaves the breaker `CLOSED` |
 | `openDuration = 30s` | rejected at `t+29.999s`, admitted at `t+30.000s` and the state becomes `HALF_OPEN` |
 | `halfOpenThreshold = 3` | probes 1–3 admitted, probe 4 rejected |
@@ -177,7 +177,7 @@ Every row below was produced by running the sources — a throwaway harness in t
 | `AssertionError` from the callback | escapes uncaught, breaker stays `CLOSED`, `failureCount` stays `0` |
 | Nested breaker rejects | the outer breaker records the inner `CircuitBreakerOpenException` as a dependency failure |
 | `canTryHalfOpen` while `CLOSED` | throws `NullPointerException` on the unset `openedAt` |
-| All seven invalid configs | `IllegalArgumentException` |
+| Ten invalid configs — zero and negative for each threshold, `successThreshold > halfOpenThreshold`, zero/negative/`null` duration | `IllegalArgumentException` |
 | `else if` branch in `HalfOpenState.onSuccess` | never taken in sequential use across the 126 valid `(failureThreshold, halfOpenThreshold, successThreshold)` combinations; taken in 90 of those 126 as soon as every probe is admitted before its outcome is recorded (concurrent callers), and also once rejections have inflated the probe counter — either way the breaker reopens on a success (note 2) |
 | `null` request passed to the facade | the `NullPointerException` is caught and recorded as a dependency failure; three such calls take a healthy breaker to `OPEN` (note 16) |
 | Probe admitted, then never returns | the breaker sits in `HALF_OPEN` indefinitely; the next request is rejected on the exhausted probe budget and no later request is admitted (note 17) |
